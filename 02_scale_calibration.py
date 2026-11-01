@@ -1,193 +1,240 @@
 """
-Step 2: Fully autonomous scale calibration
-============================================
-Detects the ArUco marker's 4 corners in 2D in every image (sub-pixel
-accurate), then triangulates each corner's 3D position using COLMAP's
-own camera poses (from the DENSE/undistorted sparse model, so the
-coordinate frame matches dense/fused.ply exactly). No manual clicking.
+Step 2 (patched): autonomous scale calibration from an ArUco marker
+===================================================================
+Detects the marker's 4 corners in every image, triangulates them with COLMAP's camera
+poses and converts the model's arbitrary units to centimetres.
 
-SETUP (must be done during capture, before running this):
-  1. Print an ArUco marker (DICT_4X4_50, ID 0) at a KNOWN physical size,
-     e.g. exactly 10.0 cm x 10.0 cm side length. Print flat, no folds.
-     Free generator: https://chev.me/arucogen/
-  2. Place it flat on the road next to the pothole, visible in several
-     photos fed into COLMAP.
-  3. Measure the printed marker's actual black-square side length with
-     a ruler and set MARKER_SIZE_CM below.
+What changed vs the original, and why:
+  * Images were counted TWICE on Windows (the glob for *.jpg and *.JPG both match the same
+    file, so 17 photos showed up as 34). Now each file is listed once.
+  * Detection now runs on the UNDISTORTED images (dense/images) because the camera poses
+    come from the undistorted model - pixels and camera model now match.
+  * Only marker ID 0 is used (before, whatever marker was found first was used).
+  * Sub-pixel corner refinement is switched on (the docstring promised it, the code
+    did not enable it).
+  * If nothing is found, it tries other ArUco dictionaries and tells you which one matches.
 
-Requires: pip install pycolmap opencv-contrib-python
-
-Run after 01_reconstruct.py:
-    python 02_scale_calibration.py
-Prints and saves scale_factor.json for the next step to consume.
+Usage:  python 02_scale_calibration.py
 """
 
-import os
-import glob
-import json
+import os, json
 import cv2
 import numpy as np
 
-# -----------------------------------------------------------------
-# CONFIG
-# -----------------------------------------------------------------
-PROJECT_DIR = r"D:\MinProject"
-IMAGE_DIR = os.path.join(PROJECT_DIR, "images")
-# Use the UNDISTORTED sparse model (matches dense/fused.ply's coordinate frame)
+PROJECT_DIR = os.environ.get("POTHOLE_PROJECT_DIR", r"D:\MinProject")
+ORIGINAL_IMAGES = os.path.join(PROJECT_DIR, "images")
+UNDISTORTED_IMGS = os.path.join(PROJECT_DIR, "dense", "images")
 DENSE_SPARSE_PATH = os.path.join(PROJECT_DIR, "dense", "sparse")
 OUTPUT_JSON = os.path.join(PROJECT_DIR, "scale_factor.json")
 
-MARKER_SIZE_CM = 10.0
-ARUCO_DICT = cv2.aruco.DICT_4X4_50
-MIN_VIEWS_REQUIRED = 2  # minimum images marker must be seen in per corner
+MARKER_SIZE_CM = 10.0  # MEASURE the printed black square with a ruler!
+ARUCO_DICT_NAME = "DICT_4X4_50"
+MARKER_ID = 0
+MIN_VIEWS_REQUIRED = 2
+
+DICT_CANDIDATES = [
+    "DICT_4X4_50",
+    "DICT_4X4_100",
+    "DICT_4X4_250",
+    "DICT_4X4_1000",
+    "DICT_5X5_50",
+    "DICT_5X5_100",
+    "DICT_5X5_250",
+    "DICT_5X5_1000",
+    "DICT_6X6_50",
+    "DICT_6X6_100",
+    "DICT_6X6_250",
+    "DICT_6X6_1000",
+    "DICT_7X7_50",
+    "DICT_7X7_100",
+    "DICT_7X7_250",
+    "DICT_7X7_1000",
+    "DICT_ARUCO_ORIGINAL",
+    "DICT_APRILTAG_16h5",
+    "DICT_APRILTAG_25h9",
+    "DICT_APRILTAG_36h10",
+    "DICT_APRILTAG_36h11",
+]
 
 
-# -----------------------------------------------------------------
-# STEP A: Detect marker corners in 2D across all images
-# -----------------------------------------------------------------
-def detect_marker_corners_2d(image_dir):
-    aruco_dict = cv2.aruco.getPredefinedDictionary(ARUCO_DICT)
-    aruco_params = cv2.aruco.DetectorParameters()
-    detector = cv2.aruco.ArucoDetector(aruco_dict, aruco_params)
-
-    image_paths = sorted(
-        glob.glob(os.path.join(image_dir, "*.jpg"))
-        + glob.glob(os.path.join(image_dir, "*.JPG"))
-        + glob.glob(os.path.join(image_dir, "*.jpeg"))
-        + glob.glob(os.path.join(image_dir, "*.JPEG"))
-        + glob.glob(os.path.join(image_dir, "*.png"))
-        + glob.glob(os.path.join(image_dir, "*.PNG"))
+def list_images(folder):
+    return sorted(
+        os.path.join(folder, f)
+        for f in os.listdir(folder)
+        if f.lower().endswith((".jpg", ".jpeg", ".png"))
     )
-    print(f"Found {len(image_paths)} images in {image_dir}")
 
-    detections = {}
+
+def make_detector(dict_name):
+    d = cv2.aruco.getPredefinedDictionary(getattr(cv2.aruco, dict_name))
+    p = cv2.aruco.DetectorParameters()
+    p.cornerRefinementMethod = cv2.aruco.CORNER_REFINE_SUBPIX
+    return cv2.aruco.ArucoDetector(d, p)
+
+
+def detect_marker_corners_2d(
+    image_paths, dict_name=ARUCO_DICT_NAME, marker_id=MARKER_ID
+):
+    detector = make_detector(dict_name)
+    detections, other_ids = {}, {}
     for path in image_paths:
         img = cv2.imread(path)
         if img is None:
             continue
-        gray = cv2.cvtColor(img, cv2.COLOR_BGR2GRAY)
-        corners, ids, _ = detector.detectMarkers(gray)
-        if ids is not None and len(ids) > 0:
-            detections[os.path.basename(path)] = corners[0][0]  # 4x2 pixel coords
-
-    print(f"Marker detected in {len(detections)} / {len(image_paths)} images")
+        corners, ids, _ = detector.detectMarkers(cv2.cvtColor(img, cv2.COLOR_BGR2GRAY))
+        if ids is None:
+            continue
+        for c, i in zip(corners, ids.flatten()):
+            if int(i) == marker_id:
+                detections[os.path.basename(path)] = c[0]  # 4x2 pixel coords
+            else:
+                other_ids[int(i)] = other_ids.get(int(i), 0) + 1
+    print(
+        f"Marker ID {marker_id} ({dict_name}) detected in {len(detections)} / {len(image_paths)} images"
+    )
+    if other_ids:
+        print(
+            f"  (other marker IDs seen: {other_ids} - the printed marker may have a different ID)"
+        )
     return detections
 
 
-# -----------------------------------------------------------------
-# STEP B: Triangulate each corner's 3D position from COLMAP poses
-# -----------------------------------------------------------------
+def diagnose_dictionaries(image_paths, max_images=12):
+    """Called when nothing was found: which ArUco dictionary (if any) matches the photos?"""
+    step = max(1, len(image_paths) // max_images)
+    sample = image_paths[::step][:max_images]
+    print(
+        f"\nNo marker found - trying {len(DICT_CANDIDATES)} dictionaries on {len(sample)} sample photos ..."
+    )
+    found = {}
+    for name in DICT_CANDIDATES:
+        if not hasattr(cv2.aruco, name):
+            continue
+        det = make_detector(name)
+        hits, ids_seen = 0, set()
+        for p in sample:
+            img = cv2.imread(p)
+            if img is None:
+                continue
+            _, ids, _ = det.detectMarkers(cv2.cvtColor(img, cv2.COLOR_BGR2GRAY))
+            if ids is not None and len(ids):
+                hits += 1
+                ids_seen |= set(int(i) for i in ids.flatten())
+        if hits:
+            found[name] = (hits, sorted(ids_seen))
+    if found:
+        print("Markers WERE found with these dictionaries (hits, IDs):")
+        for k, v in sorted(found.items(), key=lambda kv: -kv[1][0]):
+            print(f"   {k}: seen in {v[0]} photos, IDs {v[1]}")
+        print(
+            "-> Set ARUCO_DICT_NAME / MARKER_ID at the top of this file to match your printed marker."
+        )
+        print(
+            "   (A single hit in an unrelated dictionary can be a false detection; trust the one with most hits.)"
+        )
+    else:
+        print(
+            "No ArUco/AprilTag marker found with ANY dictionary. Either the marker is not in these photos,\n"
+            "or it is too small / blurred / glary. Open a photo and check that a printed marker is visible\n"
+            "and covers at least ~100 pixels across. Otherwise re-shoot with the marker in view."
+        )
+
+
 def triangulate_marker_corners(sparse_path, detections):
     import pycolmap
 
     reconstruction = pycolmap.Reconstruction(sparse_path)
     name_to_image = {img.name: img for img in reconstruction.images.values()}
     cameras = reconstruction.cameras
-
     corner_rays = [[] for _ in range(4)]
-    used_images = 0
-
+    used = 0
     for img_name, corners_2d in detections.items():
         if img_name not in name_to_image:
             continue
         image = name_to_image[img_name]
         camera = cameras[image.camera_id]
-        cam_from_world = image.cam_from_world
-        world_from_cam = cam_from_world.inverse()
-        cam_center = world_from_cam.translation
-        used_images += 1
-
+        cfw = image.cam_from_world
+        world_from_cam = (cfw() if callable(cfw) else cfw).inverse()
+        cam_center = np.asarray(world_from_cam.translation)
+        used += 1
         for i, px in enumerate(corners_2d):
-            ray_cam = camera.cam_from_img(px)
-            ray_cam = np.array([ray_cam[0], ray_cam[1], 1.0])
-            ray_world = world_from_cam.rotation * ray_cam
-            ray_world = ray_world / np.linalg.norm(ray_world)
-            corner_rays[i].append((cam_center, ray_world))
-
-    print(f"Marker images matched to COLMAP poses: {used_images}")
+            r = camera.cam_from_img(px)
+            ray_world = world_from_cam.rotation * np.array([r[0], r[1], 1.0])
+            corner_rays[i].append((cam_center, ray_world / np.linalg.norm(ray_world)))
+    print(f"Marker images matched to COLMAP poses: {used}")
 
     def triangulate_rays(rays):
-        # Least-squares closest point to a bundle of 3D lines
-        A = np.zeros((3, 3))
-        b = np.zeros(3)
-        for origin, d in rays:
+        A, b = np.zeros((3, 3)), np.zeros(3)
+        for o, d in rays:
             d = np.asarray(d).reshape(3, 1)
-            proj = np.eye(3) - d @ d.T
-            A += proj
-            b += proj @ np.asarray(origin)
+            P = np.eye(3) - d @ d.T
+            A += P
+            b += P @ np.asarray(o)
         return np.linalg.solve(A, b)
 
-    corners_3d = []
+    out = []
     for i, rays in enumerate(corner_rays):
         if len(rays) < MIN_VIEWS_REQUIRED:
             raise RuntimeError(
-                f"Corner {i} only seen in {len(rays)} image(s); "
-                f"need at least {MIN_VIEWS_REQUIRED}. Move the marker more "
-                f"centrally in the scene or capture more overlapping photos."
+                f"Corner {i} only seen in {len(rays)} registered image(s); need {MIN_VIEWS_REQUIRED}. "
+                "Capture more overlapping photos with the marker in view."
             )
-        corners_3d.append(triangulate_rays(rays))
+        out.append(triangulate_rays(rays))
+    return np.array(out)
 
-    return np.array(corners_3d)
 
-
-# -----------------------------------------------------------------
-# STEP C: Compute scale factor + a reprojection-based sanity score
-# -----------------------------------------------------------------
-def compute_scale_factor(corners_3d):
-    top = np.linalg.norm(corners_3d[0] - corners_3d[1])
-    right = np.linalg.norm(corners_3d[1] - corners_3d[2])
-    bottom = np.linalg.norm(corners_3d[2] - corners_3d[3])
-    left = np.linalg.norm(corners_3d[3] - corners_3d[0])
-
-    side_lengths = [top, right, bottom, left]
-    measured_units = float(np.mean(side_lengths))
-    side_std = float(np.std(side_lengths))
-
-    scale_factor = MARKER_SIZE_CM / measured_units
-    # relative disagreement between the 4 sides = confidence signal
-    disagreement_pct = side_std / measured_units if measured_units > 0 else 1.0
-
-    return scale_factor, measured_units, disagreement_pct
+def compute_scale_factor(c3d):
+    sides = [np.linalg.norm(c3d[i] - c3d[(i + 1) % 4]) for i in range(4)]
+    mean = float(np.mean(sides))
+    return (
+        MARKER_SIZE_CM / mean,
+        mean,
+        (float(np.std(sides)) / mean if mean > 0 else 1.0),
+    )
 
 
 def main():
-    detections = detect_marker_corners_2d(IMAGE_DIR)
-    if len(detections) < MIN_VIEWS_REQUIRED:
-        raise SystemExit(
-            f"Marker only detected in {len(detections)} image(s). "
-            f"Need at least {MIN_VIEWS_REQUIRED}. Check marker visibility, "
-            f"lighting, and focus."
-        )
-
-    corners_3d = triangulate_marker_corners(DENSE_SPARSE_PATH, detections)
-    scale_factor, measured_units, disagreement_pct = compute_scale_factor(corners_3d)
-
-    print(f"\nTriangulated marker side (avg of 4 edges): {measured_units:.5f} units")
-    print(f"Side-length disagreement: {disagreement_pct*100:.2f}%")
-    print(f"Scale factor: {scale_factor:.4f} cm/unit")
-
-    if disagreement_pct > 0.05:
+    if os.path.isdir(UNDISTORTED_IMGS) and list_images(UNDISTORTED_IMGS):
+        image_dir = UNDISTORTED_IMGS
+    else:
+        image_dir = ORIGINAL_IMAGES
         print(
-            "\nWARNING: the 4 triangulated sides disagree by >5%. This usually "
-            "means the marker was flexed/not flat, poorly detected in some "
-            "images, or the sparse/dense coordinate frames don't match. "
-            "Treat this scale factor with caution."
+            "WARNING: dense/images not found - using the original photos (run 01_reconstruct.py first)."
+        )
+    paths = list_images(image_dir)
+    print(f"Found {len(paths)} images in {image_dir}")
+
+    detections = detect_marker_corners_2d(paths)
+    if len(detections) < MIN_VIEWS_REQUIRED:
+        diagnose_dictionaries(list_images(ORIGINAL_IMAGES))
+        raise SystemExit(
+            f"\nMarker ID {MARKER_ID} found in only {len(detections)} image(s); need {MIN_VIEWS_REQUIRED}."
         )
 
+    c3d = triangulate_marker_corners(DENSE_SPARSE_PATH, detections)
+    scale, units, disagreement = compute_scale_factor(c3d)
+    print(f"\nTriangulated marker side (avg of 4 edges): {units:.5f} units")
+    print(f"Side-length disagreement: {disagreement*100:.2f}%   (good: < 2%)")
+    print(f"Scale factor: {scale:.4f} cm/unit")
+    if disagreement > 0.05:
+        print(
+            "\nWARNING: sides disagree by >5% - marker not flat, poorly detected, or too small. Do not trust this scale."
+        )
     with open(OUTPUT_JSON, "w") as f:
         json.dump(
             {
-                "scale_factor_cm_per_unit": scale_factor,
-                "measured_marker_units": measured_units,
-                "disagreement_pct": disagreement_pct,
+                "scale_factor_cm_per_unit": scale,
+                "measured_marker_units": units,
+                "disagreement_pct": disagreement,
                 "marker_size_cm": MARKER_SIZE_CM,
+                "marker_dictionary": ARUCO_DICT_NAME,
+                "marker_id": MARKER_ID,
                 "num_images_used": len(detections),
             },
             f,
             indent=2,
         )
-
-    print(f"\n✅ Saved scale factor to {OUTPUT_JSON}")
+    print(f"\nSaved scale factor to {OUTPUT_JSON}")
 
 
 if __name__ == "__main__":
